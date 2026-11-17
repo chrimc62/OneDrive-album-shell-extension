@@ -1,0 +1,6 @@
+.vs/
+**/bin/
+**/obj/
+*.user
+*.suo
+AlbumShell.App/Properties/launchSettings.json

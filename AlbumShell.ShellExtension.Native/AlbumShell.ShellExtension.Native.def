@@ -1,0 +1,3 @@
+EXPORTS
+	DllGetClassObject=AlbumDllGetClassObject PRIVATE
+	DllCanUnloadNow=AlbumDllCanUnloadNow PRIVATE
