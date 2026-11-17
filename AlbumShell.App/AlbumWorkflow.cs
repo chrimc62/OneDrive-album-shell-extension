@@ -35,7 +35,6 @@ internal static class AlbumWorkflow
             throw new InvalidOperationException("No local OneDrive sync folder was found. Sign in to the OneDrive desktop app and make sure its folder is available.");
         var primaryRoot = syncRoots[0];
 
-        status("Resolving the selected OneDrive files...");
         var processed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var selectedItems = new List<JsonElement>();
         var uploadedFiles = new List<string>();
@@ -44,10 +43,11 @@ internal static class AlbumWorkflow
         for (var index = 0; index < paths.Count; index++)
         {
             var path = paths[index];
+            var name = Path.GetFileName(path);
+            status($"Resolving file {index + 1} of {paths.Count} in OneDrive: {name}...");
             if (!File.Exists(path))
                 throw new FileNotFoundException("A selected file no longer exists.", path);
 
-            var name = Path.GetFileName(path);
             var syncRoot = OneDriveSyncRoot.FindContainingRoot(path, syncRoots);
             string relativePath;
             var wasCopiedToSyncFolder = false;
@@ -78,25 +78,20 @@ internal static class AlbumWorkflow
         }
 
         status("Finding or creating the OneDrive photo album...");
-        var album = await api.GetOrCreateAlbumAsync(albumName, selectedItems.Select(GetId).ToArray());
+        var albumId = await api.GetOrCreateAlbumAsync(albumName);
         var addedToAlbum = 0;
-        if (album.Created)
+        var albumItems = await api.GetChildrenAsync($"bundles/{Uri.EscapeDataString(albumId)}");
+        var albumItemIds = albumItems.Select(GetId).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        status($"Added {addedToAlbum} of {selectedItems.Count} selected photos to the album...");
+        foreach (var item in selectedItems)
         {
-            addedToAlbum = selectedItems.Count;
-        }
-        else
-        {
-            var albumItems = await api.GetChildrenAsync($"bundles/{Uri.EscapeDataString(album.Id)}");
-            var albumItemIds = albumItems.Select(GetId).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            foreach (var item in selectedItems)
+            var itemId = GetId(item);
+            if (albumItemIds.Add(itemId))
             {
-                var itemId = GetId(item);
-                if (albumItemIds.Add(itemId))
-                {
-                    await api.AddToAlbumAsync(album.Id, itemId);
-                    addedToAlbum++;
-                }
+                await api.AddToAlbumAsync(albumId, itemId);
+                addedToAlbum++;
             }
+            status($"Added {addedToAlbum} of {selectedItems.Count} selected photos to the album...");
         }
 
         return new AlbumWorkflowResult(uploadedFiles, existingFiles, addedToAlbum);
@@ -239,7 +234,7 @@ internal static class AlbumWorkflow
             throw new InvalidOperationException($"OneDrive did not sync '{relativePath}' within two minutes. The file remains in the local OneDrive folder; wait for sync and try again.");
         }
 
-        public async Task<(string Id, bool Created)> GetOrCreateAlbumAsync(string name, IReadOnlyList<string> itemIds)
+        public async Task<string> GetOrCreateAlbumAsync(string name)
         {
             string? next = BaseUrl + "bundles";
             while (next is not null)
@@ -250,7 +245,7 @@ internal static class AlbumWorkflow
                 {
                     if (GetName(item).Equals(name, StringComparison.OrdinalIgnoreCase) &&
                         item.TryGetProperty("bundle", out var bundle) && bundle.TryGetProperty("album", out _))
-                        return (GetId(item), false);
+                        return GetId(item);
                 }
                 next = document.RootElement.TryGetProperty("@odata.nextLink", out var link) ? link.GetString() : null;
             }
@@ -258,11 +253,10 @@ internal static class AlbumWorkflow
             using var created = await SendJsonAsync(HttpMethod.Post, "bundles", new Dictionary<string, object>
             {
                 ["name"] = name,
-                ["bundle"] = new { album = new { } },
-                ["children"] = itemIds.Select(id => new { id }).ToArray()
+                ["bundle"] = new { album = new { } }
             });
             using var result = await JsonDocument.ParseAsync(await created.Content.ReadAsStreamAsync());
-            return (GetId(result.RootElement), true);
+            return GetId(result.RootElement);
         }
 
         public async Task AddToAlbumAsync(string bundleId, string itemId)

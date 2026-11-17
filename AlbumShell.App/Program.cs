@@ -19,7 +19,7 @@ static class Program
             return;
         }
 
-        Application.Run(new Form1(ActivationRequest.ReadFiles(args)));
+        Application.Run(new AlbumForm(ActivationRequest.ReadFiles(args)));
     }
 
     private static void RunRegistrationAction(Action action, string successMessage)

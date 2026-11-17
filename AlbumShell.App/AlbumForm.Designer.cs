@@ -1,6 +1,6 @@
 ﻿namespace AlbumShell.App;
 
-partial class Form1
+partial class AlbumForm
 {
     /// <summary>
     ///  Required designer variable.
@@ -31,7 +31,7 @@ partial class Form1
         components = new System.ComponentModel.Container();
         AutoScaleMode = AutoScaleMode.Font;
         ClientSize = new Size(800, 450);
-        Text = "Form1";
+        Text = "AlbumForm";
     }
 
     #endregion

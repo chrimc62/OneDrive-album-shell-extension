@@ -1,15 +1,15 @@
 namespace AlbumShell.App;
 
-public partial class Form1 : Form
+public partial class AlbumForm : Form
 {
     private readonly TextBox _albumName = new() { Width = 360 };
     private readonly ListBox _files = new() { Dock = DockStyle.Fill };
     private readonly Label _status = new() { AutoSize = true, Text = "Enter a OneDrive album name." };
     private readonly Button _upload = new() { Text = "Add to OneDrive album", AutoSize = true };
 
-    public Form1(IReadOnlyList<string> filePaths)
+    public AlbumForm(IReadOnlyList<string> filePaths)
     {
-        Text = "Add to OneDrive album";
+        Text = "Add to OneDrive Album";
         MinimumSize = new Size(560, 360);
         StartPosition = FormStartPosition.CenterScreen;
         AcceptButton = _upload;
@@ -55,7 +55,7 @@ public partial class Form1 : Form
         {
             var result = await AlbumWorkflow.AddFilesAsync(_files.Items.Cast<string>().ToArray(), albumName, this,
                 message => _status.Text = message);
-            _status.Text = $"Added {result.AddedToAlbumCount} file(s); uploaded {result.UploadedFiles.Count} new file(s).";
+            _status.Text = $"Added {result.AddedToAlbumCount} photo(s); uploaded {result.UploadedFiles.Count} new photo(s).";
             var message = $"Finished adding files to the OneDrive album '{albumName}'.\r\n\r\n" +
                 $"Added to album: {result.AddedToAlbumCount}\r\n" +
                 $"Newly uploaded to Pictures/{albumName}: {result.UploadedFiles.Count}\r\n" +
