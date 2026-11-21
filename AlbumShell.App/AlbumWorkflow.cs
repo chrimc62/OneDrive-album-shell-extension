@@ -10,6 +10,7 @@ namespace AlbumShell.App;
 internal static class AlbumWorkflow
 {
     private const string ClientId = "97175158-c358-4d1a-a03d-9214f3a19a16";
+    private const int MaxConcurrentFileResolutions = 4;
     private static readonly string[] Scopes = ["Files.ReadWrite"];
     private static readonly HttpClient Http = new();
 
@@ -35,8 +36,7 @@ internal static class AlbumWorkflow
             throw new InvalidOperationException("No local OneDrive sync folder was found. Sign in to the OneDrive desktop app and make sure its folder is available.");
         var primaryRoot = syncRoots[0];
 
-        var processed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var selectedItems = new List<JsonElement>();
+        var filesToResolve = new List<(string Name, string RelativePath, bool WasCopiedToSyncFolder)>();
         var uploadedFiles = new List<string>();
         var existingFiles = new List<string>();
 
@@ -44,7 +44,7 @@ internal static class AlbumWorkflow
         {
             var path = paths[index];
             var name = Path.GetFileName(path);
-            status($"Resolving file {index + 1} of {paths.Count} in OneDrive: {name}...");
+            status($"Preparing file {index + 1} of {paths.Count}: {name}...");
             if (!File.Exists(path))
                 throw new FileNotFoundException("A selected file no longer exists.", path);
 
@@ -63,22 +63,46 @@ internal static class AlbumWorkflow
                 wasCopiedToSyncFolder = wasCopied;
             }
 
-            var item = await api.WaitForItemByPathAsync(relativePath, status);
-            if (!item.TryGetProperty("photo", out _))
-                throw new InvalidOperationException($"OneDrive did not identify '{name}' as a photo, so it cannot be added to a photo album.");
+            filesToResolve.Add((name, relativePath, wasCopiedToSyncFolder));
+        }
 
-            if (wasCopiedToSyncFolder)
-                uploadedFiles.Add(Path.GetFileName(relativePath));
+        status($"Resolving {filesToResolve.Count} file(s) in OneDrive...");
+        using var resolutionGate = new SemaphoreSlim(MaxConcurrentFileResolutions);
+        var resolutionTasks = filesToResolve.Select(async (file, index) =>
+        {
+            await resolutionGate.WaitAsync();
+            try
+            {
+                status($"Resolving file {index + 1} of {filesToResolve.Count} in OneDrive: {file.Name}...");
+                var item = await api.WaitForItemByPathAsync(file.RelativePath, status);
+                if (!item.TryGetProperty("photo", out _))
+                    throw new InvalidOperationException($"OneDrive did not identify '{file.Name}' as a photo, so it cannot be added to a photo album.");
+
+                return (File: file, Item: item);
+            }
+            finally
+            {
+                resolutionGate.Release();
+            }
+        }).ToArray();
+        var resolvedFiles = await Task.WhenAll(resolutionTasks);
+
+        var processed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var selectedItems = new List<JsonElement>();
+        foreach (var resolved in resolvedFiles)
+        {
+            if (resolved.File.WasCopiedToSyncFolder)
+                uploadedFiles.Add(Path.GetFileName(resolved.File.RelativePath));
             else
-                existingFiles.Add(name);
+                existingFiles.Add(resolved.File.Name);
 
-            var itemId = GetId(item);
+            var itemId = GetId(resolved.Item);
             if (processed.Add(itemId))
-                selectedItems.Add(item);
+                selectedItems.Add(resolved.Item);
         }
 
         status("Finding or creating the OneDrive photo album...");
-        var albumId = await api.GetOrCreateAlbumAsync(albumName);
+        var albumId = await api.GetOrCreateAlbumAsync(albumName, status);
         var addedToAlbum = 0;
         var albumItems = await api.GetChildrenAsync($"bundles/{Uri.EscapeDataString(albumId)}");
         var albumItemIds = albumItems.Select(GetId).ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -88,8 +112,8 @@ internal static class AlbumWorkflow
             var itemId = GetId(item);
             if (albumItemIds.Add(itemId))
             {
-                await api.AddToAlbumAsync(albumId, itemId);
-                addedToAlbum++;
+                if (await api.AddToAlbumAsync(albumId, itemId))
+                    addedToAlbum++;
             }
             status($"Added {addedToAlbum} of {selectedItems.Count} selected photos to the album...");
         }
@@ -168,7 +192,8 @@ internal static class AlbumWorkflow
         var accounts = await app.GetAccountsAsync();
         try
         {
-            return (await app.AcquireTokenSilent(Scopes, accounts.FirstOrDefault()).ExecuteAsync()).AccessToken;
+            var token = await app.AcquireTokenSilent(Scopes, accounts.FirstOrDefault()).ExecuteAsync();
+            return token.AccessToken;
         }
         catch (MsalUiRequiredException)
         {
@@ -215,7 +240,8 @@ internal static class AlbumWorkflow
 
         public async Task<JsonElement> WaitForItemByPathAsync(string relativePath, Action<string> status)
         {
-            for (var attempt = 0; attempt < 60; attempt++)
+            var timeoutAt = DateTimeOffset.UtcNow.AddMinutes(2);
+            while (DateTimeOffset.UtcNow < timeoutAt)
             {
                 try
                 {
@@ -224,18 +250,34 @@ internal static class AlbumWorkflow
                     using var document = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
                     return document.RootElement.Clone();
                 }
-                catch (GraphException exception) when (exception.StatusCode == HttpStatusCode.NotFound && attempt < 59)
+                catch (GraphException exception) when (exception.StatusCode == HttpStatusCode.NotFound)
                 {
                     status($"Waiting for OneDrive to sync {Path.GetFileName(relativePath)}...");
-                    await Task.Delay(TimeSpan.FromSeconds(2));
+                    await DelayBeforeRetryAsync(TimeSpan.FromSeconds(2));
+                }
+                catch (GraphException exception) when (exception.StatusCode == HttpStatusCode.TooManyRequests)
+                {
+                    status($"OneDrive is busy; retrying lookup for {Path.GetFileName(relativePath)}...");
+                    var retryDelay = exception.RetryAfter is { } delay && delay > TimeSpan.Zero
+                        ? delay
+                        : TimeSpan.FromSeconds(2);
+                    await DelayBeforeRetryAsync(retryDelay);
                 }
             }
 
             throw new InvalidOperationException($"OneDrive did not sync '{relativePath}' within two minutes. The file remains in the local OneDrive folder; wait for sync and try again.");
+
+            async Task DelayBeforeRetryAsync(TimeSpan delay)
+            {
+                var remaining = timeoutAt - DateTimeOffset.UtcNow;
+                if (remaining > TimeSpan.Zero)
+                    await Task.Delay(delay < remaining ? delay : remaining);
+            }
         }
 
-        public async Task<string> GetOrCreateAlbumAsync(string name)
+        public async Task<string> GetOrCreateAlbumAsync(string name, Action<string> status)
         {
+            string? existingAlbumId = null;
             string? next = BaseUrl + "bundles";
             while (next is not null)
             {
@@ -245,11 +287,20 @@ internal static class AlbumWorkflow
                 {
                     if (GetName(item).Equals(name, StringComparison.OrdinalIgnoreCase) &&
                         item.TryGetProperty("bundle", out var bundle) && bundle.TryGetProperty("album", out _))
-                        return GetId(item);
+                    {
+                        existingAlbumId = GetId(item);
+                        break;
+                    }
                 }
+                if (existingAlbumId is not null)
+                    break;
                 next = document.RootElement.TryGetProperty("@odata.nextLink", out var link) ? link.GetString() : null;
             }
 
+            if (existingAlbumId is not null)
+                return existingAlbumId;
+
+            status($"Creating album '{name}'...");
             using var created = await SendJsonAsync(HttpMethod.Post, "bundles", new Dictionary<string, object>
             {
                 ["name"] = name,
@@ -259,10 +310,22 @@ internal static class AlbumWorkflow
             return GetId(result.RootElement);
         }
 
-        public async Task AddToAlbumAsync(string bundleId, string itemId)
+        public async Task<bool> AddToAlbumAsync(string bundleId, string itemId)
         {
-            using var response = await SendJsonAsync(HttpMethod.Post,
-                $"bundles/{Uri.EscapeDataString(bundleId)}/children", new { id = itemId });
+            try
+            {
+                using var response = await SendJsonAsync(HttpMethod.Post,
+                    $"bundles/{Uri.EscapeDataString(bundleId)}/children", new { id = itemId });
+                return true;
+            }
+            catch (GraphException exception) when (
+                exception.StatusCode == HttpStatusCode.Conflict ||
+                exception.StatusCode == HttpStatusCode.BadRequest &&
+                string.Equals(exception.ErrorCode, "invalidRequest", StringComparison.OrdinalIgnoreCase) &&
+                exception.ErrorMessage?.Contains("An Album item with same name already exists", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                return false;
+            }
         }
 
         private Task<HttpResponseMessage> SendAsync(HttpMethod method, string route) => SendAbsoluteAsync(method, BaseUrl + route);
@@ -284,13 +347,37 @@ internal static class AlbumWorkflow
             var body = await response.Content.ReadAsStringAsync();
             var message = body.Length > 1000 ? body[..1000] : body;
             var statusCode = response.StatusCode;
+            string? errorCode = null;
+            string? errorMessage = null;
+            try
+            {
+                using var errorDocument = JsonDocument.Parse(body);
+                if (errorDocument.RootElement.TryGetProperty("error", out var error))
+                {
+                    errorCode = error.TryGetProperty("code", out var code) ? code.GetString() : null;
+                    errorMessage = error.TryGetProperty("message", out var errorText) ? errorText.GetString() : null;
+                }
+            }
+            catch (JsonException)
+            {
+            }
+            var retryAfterHeader = response.Headers.RetryAfter;
+            var retryAfter = retryAfterHeader?.Delta ??
+                (retryAfterHeader?.Date is { } retryDate ? retryDate - DateTimeOffset.UtcNow : null);
+            if (retryAfter is { } retryDelay && retryDelay < TimeSpan.Zero)
+                retryAfter = TimeSpan.Zero;
             response.Dispose();
-            throw new GraphException(statusCode, $"OneDrive request failed ({(int)statusCode}): {message}");
+            throw new GraphException(statusCode, retryAfter, errorCode, errorMessage,
+                $"OneDrive request failed ({(int)statusCode}): {message}");
         }
     }
 
-    private sealed class GraphException(HttpStatusCode statusCode, string message) : Exception(message)
+    private sealed class GraphException(HttpStatusCode statusCode, TimeSpan? retryAfter, string? errorCode,
+        string? errorMessage, string message) : Exception(message)
     {
         public HttpStatusCode StatusCode { get; } = statusCode;
+        public TimeSpan? RetryAfter { get; } = retryAfter;
+        public string? ErrorCode { get; } = errorCode;
+        public string? ErrorMessage { get; } = errorMessage;
     }
 }

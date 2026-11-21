@@ -49,6 +49,8 @@ public partial class AlbumForm : Form
         }
 
         _upload.Enabled = false;
+        _albumName.ReadOnly = true;
+        _files.Enabled = false;
         var albumNameRemembered = LastAlbumNameStore.TrySave(albumName);
         _status.Text = albumNameRemembered ? "Connecting to OneDrive..." : "Connecting to OneDrive; the album name could not be saved.";
         try
@@ -76,7 +78,11 @@ public partial class AlbumForm : Form
         finally
         {
             if (!IsDisposed)
+            {
                 _upload.Enabled = true;
+                _albumName.ReadOnly = false;
+                _files.Enabled = true;
+            }
         }
     }
 
