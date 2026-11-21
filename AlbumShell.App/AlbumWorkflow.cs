@@ -11,13 +11,14 @@ internal static class AlbumWorkflow
 {
     private const string ClientId = "97175158-c358-4d1a-a03d-9214f3a19a16";
     private const int MaxConcurrentFileResolutions = 4;
+    private const string SelectedItemFields = "?$select=id,name,size,file,folder,photo";
     private static readonly string[] Scopes = ["Files.ReadWrite"];
     private static readonly HttpClient Http = new();
 
     public static bool IsValidAlbumName(string name, out string message)
     {
-        var invalid = Path.GetInvalidFileNameChars().Concat(['/', '\\', ':', '*', '?', '"', '<', '>', '|']);
-        if (string.IsNullOrWhiteSpace(name) || name is "." or ".." || name.Length > 120 || name.Any(invalid.Contains))
+        if (string.IsNullOrWhiteSpace(name) || name is "." or ".." || name.Length > 120 ||
+            name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
         {
             message = "Enter a valid album name (up to 120 characters, without Windows-invalid filename characters).";
             return false;
@@ -28,7 +29,7 @@ internal static class AlbumWorkflow
 
     public static async Task<AlbumWorkflowResult> AddFilesAsync(IReadOnlyList<string> paths, string albumName, IWin32Window owner, Action<string> status)
     {
-        var token = await GetAccessTokenAsync(ClientId, owner);
+        var token = await GetAccessTokenAsync(owner);
         var api = new GraphApi(token);
         await api.EnsurePersonalDriveAsync();
         var syncRoots = OneDriveSyncRoot.Discover();
@@ -92,7 +93,7 @@ internal static class AlbumWorkflow
         foreach (var resolved in resolvedFiles)
         {
             if (resolved.File.WasCopiedToSyncFolder)
-                uploadedFiles.Add(Path.GetFileName(resolved.File.RelativePath));
+                uploadedFiles.Add(resolved.File.Name);
             else
                 existingFiles.Add(resolved.File.Name);
 
@@ -178,11 +179,11 @@ internal static class AlbumWorkflow
         return total;
     }
 
-    private static async Task<string> GetAccessTokenAsync(string clientId, IWin32Window owner)
+    private static async Task<string> GetAccessTokenAsync(IWin32Window owner)
     {
-        var cacheDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AlbumShellExtension", "TokenCache");
+        var cacheDirectory = AppDataPaths.TokenCacheDirectory;
         Directory.CreateDirectory(cacheDirectory);
-        var app = PublicClientApplicationBuilder.Create(clientId)
+        var app = PublicClientApplicationBuilder.Create(ClientId)
             .WithAuthority("https://login.microsoftonline.com/common")
             .WithDefaultRedirectUri()
             .Build();
@@ -217,22 +218,15 @@ internal static class AlbumWorkflow
         public async Task<List<JsonElement>> GetChildrenAsync(string relativePath)
         {
             var items = new List<JsonElement>();
-            string? next = BaseUrl + relativePath + "?$select=id,name,size,file,folder,photo";
-            while (next is not null)
-            {
-                using var response = await SendAbsoluteAsync(HttpMethod.Get, next);
-                using var document = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
-                if (document.RootElement.TryGetProperty("value", out var values))
-                    items.AddRange(values.EnumerateArray().Select(value => value.Clone()));
-                next = document.RootElement.TryGetProperty("@odata.nextLink", out var link) ? link.GetString() : null;
-            }
+            await foreach (var item in GetItemsAsync(BaseUrl + relativePath + SelectedItemFields))
+                items.Add(item);
             return items;
         }
 
         public async Task EnsurePersonalDriveAsync()
         {
             using var response = await SendAsync(HttpMethod.Get, "?$select=driveType");
-            using var document = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
+            using var document = await ReadJsonAsync(response);
             var driveType = document.RootElement.TryGetProperty("driveType", out var value) ? value.GetString() : null;
             if (!string.Equals(driveType, "personal", StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("Microsoft Graph photo albums are supported only in personal OneDrive. This sign-in is using a work or school OneDrive. Sign in with the personal Microsoft account linked to your OneDrive instead.");
@@ -246,8 +240,8 @@ internal static class AlbumWorkflow
                 try
                 {
                     var encodedPath = string.Join('/', relativePath.Replace('\\', '/').Split('/').Select(Uri.EscapeDataString));
-                    using var response = await SendAsync(HttpMethod.Get, $"root:/{encodedPath}?$select=id,name,size,file,folder,photo");
-                    using var document = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
+                    using var response = await SendAsync(HttpMethod.Get, $"root:/{encodedPath}{SelectedItemFields}");
+                    using var document = await ReadJsonAsync(response);
                     return document.RootElement.Clone();
                 }
                 catch (GraphException exception) when (exception.StatusCode == HttpStatusCode.NotFound)
@@ -278,23 +272,14 @@ internal static class AlbumWorkflow
         public async Task<string> GetOrCreateAlbumAsync(string name, Action<string> status)
         {
             string? existingAlbumId = null;
-            string? next = BaseUrl + "bundles";
-            while (next is not null)
+            await foreach (var item in GetItemsAsync(BaseUrl + "bundles"))
             {
-                using var response = await SendAbsoluteAsync(HttpMethod.Get, next);
-                using var document = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
-                foreach (var item in document.RootElement.GetProperty("value").EnumerateArray())
+                if (GetName(item).Equals(name, StringComparison.OrdinalIgnoreCase) &&
+                    item.TryGetProperty("bundle", out var bundle) && bundle.TryGetProperty("album", out _))
                 {
-                    if (GetName(item).Equals(name, StringComparison.OrdinalIgnoreCase) &&
-                        item.TryGetProperty("bundle", out var bundle) && bundle.TryGetProperty("album", out _))
-                    {
-                        existingAlbumId = GetId(item);
-                        break;
-                    }
-                }
-                if (existingAlbumId is not null)
+                    existingAlbumId = GetId(item);
                     break;
-                next = document.RootElement.TryGetProperty("@odata.nextLink", out var link) ? link.GetString() : null;
+                }
             }
 
             if (existingAlbumId is not null)
@@ -306,7 +291,7 @@ internal static class AlbumWorkflow
                 ["name"] = name,
                 ["bundle"] = new { album = new { } }
             });
-            using var result = await JsonDocument.ParseAsync(await created.Content.ReadAsStreamAsync());
+            using var result = await ReadJsonAsync(created);
             return GetId(result.RootElement);
         }
 
@@ -331,17 +316,15 @@ internal static class AlbumWorkflow
         private Task<HttpResponseMessage> SendAsync(HttpMethod method, string route) => SendAbsoluteAsync(method, BaseUrl + route);
         private Task<HttpResponseMessage> SendJsonAsync(HttpMethod method, string route, object body) =>
             SendAbsoluteAsync(method, BaseUrl + route, new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json"));
-        private async Task<HttpResponseMessage> SendAbsoluteAsync(HttpMethod method, string url, HttpContent? content = null,
-            HttpCompletionOption completionOption = HttpCompletionOption.ResponseContentRead)
+        private async Task<HttpResponseMessage> SendAbsoluteAsync(HttpMethod method, string url, HttpContent? content = null)
         {
             using var request = new HttpRequestMessage(method, url) { Content = content };
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-            return await SendAndValidateAsync(request, completionOption);
+            return await SendAndValidateAsync(request);
         }
-        private static async Task<HttpResponseMessage> SendAndValidateAsync(HttpRequestMessage request,
-            HttpCompletionOption completionOption = HttpCompletionOption.ResponseContentRead)
+        private static async Task<HttpResponseMessage> SendAndValidateAsync(HttpRequestMessage request)
         {
-            var response = await Http.SendAsync(request, completionOption);
+            var response = await Http.SendAsync(request);
             if (response.IsSuccessStatusCode)
                 return response;
             var body = await response.Content.ReadAsStringAsync();
@@ -370,6 +353,25 @@ internal static class AlbumWorkflow
             throw new GraphException(statusCode, retryAfter, errorCode, errorMessage,
                 $"OneDrive request failed ({(int)statusCode}): {message}");
         }
+
+        private async IAsyncEnumerable<JsonElement> GetItemsAsync(string url)
+        {
+            string? next = url;
+            while (next is not null)
+            {
+                using var response = await SendAbsoluteAsync(HttpMethod.Get, next);
+                using var document = await ReadJsonAsync(response);
+                if (document.RootElement.TryGetProperty("value", out var values))
+                {
+                    foreach (var item in values.EnumerateArray())
+                        yield return item.Clone();
+                }
+                next = document.RootElement.TryGetProperty("@odata.nextLink", out var link) ? link.GetString() : null;
+            }
+        }
+
+        private static async Task<JsonDocument> ReadJsonAsync(HttpResponseMessage response) =>
+            await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
     }
 
     private sealed class GraphException(HttpStatusCode statusCode, TimeSpan? retryAfter, string? errorCode,

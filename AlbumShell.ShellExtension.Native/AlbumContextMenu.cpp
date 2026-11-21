@@ -80,12 +80,10 @@ namespace
             commandLine += QuoteArgument(path);
         }
 
-        std::vector<wchar_t> mutableCommandLine(commandLine.begin(), commandLine.end());
-        mutableCommandLine.push_back(L'\0');
         STARTUPINFOW startupInfo{};
         startupInfo.cb = sizeof(startupInfo);
         PROCESS_INFORMATION processInfo{};
-        if (!CreateProcessW(applicationPath.c_str(), mutableCommandLine.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startupInfo, &processInfo))
+        if (!CreateProcessW(applicationPath.c_str(), commandLine.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startupInfo, &processInfo))
             return HRESULT_FROM_WIN32(GetLastError());
 
         CloseHandle(processInfo.hThread);

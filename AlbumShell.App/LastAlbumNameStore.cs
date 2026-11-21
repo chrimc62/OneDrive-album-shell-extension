@@ -2,8 +2,7 @@ namespace AlbumShell.App;
 
 internal static class LastAlbumNameStore
 {
-    private static readonly string FilePath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AlbumShellExtension", "last-album-name.txt");
+    private static readonly string FilePath = AppDataPaths.LastAlbumName;
 
     public static string Load()
     {
@@ -11,11 +10,7 @@ internal static class LastAlbumNameStore
         {
             return File.Exists(FilePath) ? File.ReadAllText(FilePath).Trim() : string.Empty;
         }
-        catch (IOException)
-        {
-            return string.Empty;
-        }
-        catch (UnauthorizedAccessException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
             return string.Empty;
         }
@@ -29,11 +24,7 @@ internal static class LastAlbumNameStore
             File.WriteAllText(FilePath, albumName);
             return true;
         }
-        catch (IOException)
-        {
-            return false;
-        }
-        catch (UnauthorizedAccessException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
             return false;
         }

@@ -1,6 +1,6 @@
 namespace AlbumShell.App;
 
-public partial class AlbumForm : Form
+internal sealed class AlbumForm : Form
 {
     private readonly TextBox _albumName = new() { Width = 360 };
     private readonly ListBox _files = new() { Dock = DockStyle.Fill };
